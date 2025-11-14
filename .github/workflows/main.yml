@@ -25,7 +25,6 @@ jobs:
             dir=in action=allow protocol=TCP localport=3389
 
           # Additional Windows 11 optimizations
-          # Disable connection limits
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
                            -Name "MaxInstanceCount" -Value 4294967295 -Force
 
@@ -33,12 +32,12 @@ jobs:
           Restart-Service -Name TermService -Force
           Restart-Service -Name SessionEnv -Force
 
-      - name: Create RDP User with Secure Password
+      - name: Create RDP User razzdev with Secure Password
         run: |
           # Remove existing user if exists
-          $existingUser = Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
+          $existingUser = Get-LocalUser -Name "razzdev" -ErrorAction SilentlyContinue
           if ($existingUser) {
-              Remove-LocalUser -Name "RDP"
+              Remove-LocalUser -Name "razzdev"
           }
 
           # Generate secure password
@@ -58,70 +57,126 @@ jobs:
           $password = -join ($rawPassword | Sort-Object { Get-Random })
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
 
-          # Create user
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -FullName "RDP User"
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-          Set-LocalUser -Name "RDP" -PasswordNeverExpires $true
+          # Create user razzdev
+          New-LocalUser -Name "razzdev" -Password $securePass -AccountNeverExpires -FullName "Razz Development User"
+          Add-LocalGroupMember -Group "Administrators" -Member "razzdev"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "razzdev"
+          Set-LocalUser -Name "razzdev" -PasswordNeverExpires $true
           
           # Store credentials
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          echo "RDP_CREDS=User: razzdev | Password: $password" >> $env:GITHUB_ENV
+          echo "RDP_USERNAME=razzdev" >> $env:GITHUB_ENV
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
           
           # Verify user creation
-          if (-not (Get-LocalUser -Name "RDP")) {
+          if (-not (Get-LocalUser -Name "razzdev")) {
               Write-Error "User creation failed"
               exit 1
           }
+          Write-Host "User 'razzdev' created successfully"
 
       - name: Install Tailscale
         run: |
+          # Download latest Tailscale
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
 
-          # Download and install Tailscale
+          Write-Host "Downloading Tailscale..."
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          
+          Write-Host "Installing Tailscale..."
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
 
           # Wait for installation to complete
-          Start-Sleep -Seconds 10
-          
+          Start-Sleep -Seconds 15
+          Write-Host "Tailscale installation completed"
+
       - name: Establish Tailscale Connection
         run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=win11-pro-rdp-$env:GITHUB_RUN_ID
+          Write-Host "Starting Tailscale connection..."
           
-          # Get Tailscale IP
+          # Check if Tailscale is installed properly
+          if (-not (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe")) {
+              Write-Error "Tailscale not found in Program Files"
+              exit 1
+          }
+
+          Write-Host "Tailscale executable found, proceeding with authentication..."
+          
+          # Run tailscale up with authkey
+          $authResult = & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=win11-pro-razzdev-$env:GITHUB_RUN_ID --accept-routes --accept-dns --reset 2>&1
+          Write-Host "Tailscale up output: $authResult"
+          
+          # Check if authentication requires a URL
+          if ($authResult -like "*https://*") {
+              Write-Host "Authentication required. Please visit the URL below:"
+              Write-Host $authResult
+          }
+          
+          # Wait a bit for connection to establish
+          Start-Sleep -Seconds 10
+          
+          # Get Tailscale IP with more retries and better error handling
           $tsIP = $null
           $retries = 0
-          while (-not $tsIP -and $retries -lt 15) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              if (-not $tsIP) {
-                  Start-Sleep -Seconds 5
+          $maxRetries = 20
+          
+          while (-not $tsIP -and $retries -lt $maxRetries) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>&1
+              
+              if ($LASTEXITCODE -ne 0 -or -not $tsIP -or $tsIP -like "*error*") {
+                  Write-Host "Attempt $($retries + 1)/$maxRetries - No IP assigned yet. Waiting..."
+                  $tsIP = $null
+                  Start-Sleep -Seconds 10
                   $retries++
+              } else {
+                  Write-Host "Tailscale IP successfully obtained: $tsIP"
+                  break
               }
           }
           
           if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned after $retries attempts"
+              Write-Host "Checking Tailscale status for debugging..."
+              $status = & "$env:ProgramFiles\Tailscale\tailscale.exe" status 2>&1
+              Write-Host "Tailscale status: $status"
+              
+              Write-Host "Checking network adapters..."
+              Get-NetAdapter | Format-Table Name, Status, InterfaceDescription
+              
+              Write-Error "Tailscale IP not assigned after $maxRetries attempts. Please check your Tailscale auth key and network connectivity."
               exit 1
           }
           
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-          Write-Host "Tailscale IP: $tsIP"
+          Write-Host "✅ Tailscale connection established: $tsIP"
+
+      - name: Verify Tailscale Status
+        run: |
+          Write-Host "Verifying Tailscale connection..."
+          $status = & "$env:ProgramFiles\Tailscale\tailscale.exe" status
+          Write-Host "Tailscale Status:"
+          Write-Host $status
+          
+          $netcheck = & "$env:ProgramFiles\Tailscale\tailscale.exe" netcheck
+          Write-Host "Network Check:"
+          Write-Host $netcheck
 
       - name: Verify RDP Accessibility
         run: |
-          Write-Host "Testing RDP connectivity to $env:TAILSCALE_IP"
+          Write-Host "Testing RDP connectivity to $env:TAILSCALE_IP on port 3389"
           
-          # Test RDP port
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "RDP connection test failed"
-              Write-Host "Checking firewall status..."
+          # Test RDP port with timeout
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue -InformationLevel Quiet
+          
+          if ($testResult) {
+              Write-Host "✅ RDP connectivity test successful!"
+          } else {
+              Write-Error "❌ RDP connection test failed"
+              Write-Host "Checking firewall rules..."
               netsh advfirewall firewall show rule name="RDP-Tailscale"
               exit 1
           }
-          Write-Host "RDP connectivity test successful!"
 
       - name: Display Connection Information
         run: |
@@ -130,32 +185,43 @@ jobs:
           Write-Host "🚀 WINDOWS 11 PRO RDP READY"
           Write-Host "================================================"
           Write-Host "IP Address: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $($env:RDP_CREDS.Split('|')[1].Trim())"
+          Write-Host "Username: razzdev"
+          Write-Host "Password: $env:RDP_PASSWORD"
           Write-Host "================================================"
           Write-Host "To connect:"
           Write-Host "1. Ensure Tailscale is installed on your device"
           Write-Host "2. Use Microsoft Remote Desktop"
           Write-Host "3. Connect to: $env:TAILSCALE_IP"
+          Write-Host "4. Username: razzdev"
+          Write-Host "5. Password: $env:RDP_PASSWORD"
           Write-Host "================================================"
           Write-Host ""
 
       - name: Maintain RDP Session
         run: |
           Write-Host "RDP session active - Use Ctrl+C in workflow to terminate"
+          Write-Host "Username: razzdev"
+          Write-Host "IP: $env:TAILSCALE_IP"
           
           # Keep-alive loop with status updates
           $counter = 0
           while ($true) {
               $counter++
               $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-              Write-Host "[$timestamp] RDP Session active - $counter hours elapsed"
+              Write-Host "[$timestamp] RDP Session active - User: razzdev - $counter minutes elapsed"
               
-              # Verify Tailscale connection every hour
-              if ($counter % 12 -eq 0) {
-                  $tsStatus = & "$env:ProgramFiles\Tailscale\tailscale.exe" status
-                  Write-Host "Tailscale Status Check: $tsStatus"
+              # Verify connection every 5 minutes
+              if ($counter % 5 -eq 0) {
+                  $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+                  Write-Host "Tailscale IP Check: $tsIP"
+                  
+                  # Verify user still exists
+                  $userCheck = Get-LocalUser -Name "razzdev" -ErrorAction SilentlyContinue
+                  if (-not $userCheck) {
+                      Write-Error "User razzdev no longer exists!"
+                      exit 1
+                  }
               }
               
-              Start-Sleep -Seconds 3600  # Check every hour
+              Start-Sleep -Seconds 60  # Check every minute
           }
