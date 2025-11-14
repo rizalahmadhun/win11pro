@@ -1,0 +1,161 @@
+name: RDP Windows 11 Pro
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure Windows 11 Pro RDP Settings
+        run: |
+          # Enable RDP
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                           -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "SecurityLayer" -Value 0 -Force
+
+          # Configure Windows 11 specific firewall rules
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          # Additional Windows 11 optimizations
+          # Disable connection limits
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                           -Name "MaxInstanceCount" -Value 4294967295 -Force
+
+          # Restart RDP services
+          Restart-Service -Name TermService -Force
+          Restart-Service -Name SessionEnv -Force
+
+      - name: Create RDP User with Secure Password
+        run: |
+          # Remove existing user if exists
+          $existingUser = Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
+          if ($existingUser) {
+              Remove-LocalUser -Name "RDP"
+          }
+
+          # Generate secure password
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
+              Special = ([char[]](33..47) + [char[]](58..64) +
+                         [char[]](91..96) + [char[]](123..126))
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          # Create user
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -FullName "RDP User"
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          Set-LocalUser -Name "RDP" -PasswordNeverExpires $true
+          
+          # Store credentials
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          
+          # Verify user creation
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+
+          # Download and install Tailscale
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+          # Wait for installation to complete
+          Start-Sleep -Seconds 10
+          
+      - name: Establish Tailscale Connection
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=win11-pro-rdp-$env:GITHUB_RUN_ID
+          
+          # Get Tailscale IP
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 15) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              if (-not $tsIP) {
+                  Start-Sleep -Seconds 5
+                  $retries++
+              }
+          }
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned after $retries attempts"
+              exit 1
+          }
+          
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "Tailscale IP: $tsIP"
+
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Testing RDP connectivity to $env:TAILSCALE_IP"
+          
+          # Test RDP port
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "RDP connection test failed"
+              Write-Host "Checking firewall status..."
+              netsh advfirewall firewall show rule name="RDP-Tailscale"
+              exit 1
+          }
+          Write-Host "RDP connectivity test successful!"
+
+      - name: Display Connection Information
+        run: |
+          Write-Host ""
+          Write-Host "================================================"
+          Write-Host "🚀 WINDOWS 11 PRO RDP READY"
+          Write-Host "================================================"
+          Write-Host "IP Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $($env:RDP_CREDS.Split('|')[1].Trim())"
+          Write-Host "================================================"
+          Write-Host "To connect:"
+          Write-Host "1. Ensure Tailscale is installed on your device"
+          Write-Host "2. Use Microsoft Remote Desktop"
+          Write-Host "3. Connect to: $env:TAILSCALE_IP"
+          Write-Host "================================================"
+          Write-Host ""
+
+      - name: Maintain RDP Session
+        run: |
+          Write-Host "RDP session active - Use Ctrl+C in workflow to terminate"
+          
+          # Keep-alive loop with status updates
+          $counter = 0
+          while ($true) {
+              $counter++
+              $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+              Write-Host "[$timestamp] RDP Session active - $counter hours elapsed"
+              
+              # Verify Tailscale connection every hour
+              if ($counter % 12 -eq 0) {
+                  $tsStatus = & "$env:ProgramFiles\Tailscale\tailscale.exe" status
+                  Write-Host "Tailscale Status Check: $tsStatus"
+              }
+              
+              Start-Sleep -Seconds 3600  # Check every hour
+          }
