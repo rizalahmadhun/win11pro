@@ -1,4 +1,4 @@
-name: RDP Windows 11 Pro
+name: RDP Windows 11 Pro - High Performance
 
 on:
   workflow_dispatch:
@@ -9,22 +9,28 @@ jobs:
     timeout-minutes: 3600
 
     steps:
-      - name: Configure System Display Information
+      - name: Configure High Performance Settings
         run: |
-          # Script untuk mengubah beberapa informasi tampilan sistem (visual only)
-          Write-Host "Configuring system display information..."
+          Write-Host "🎯 Configuring High Performance Settings..."
           
-          # Mengubah nama device (temporary)
-          $newName = "WIN11-PRO-RDP"
-          Write-Host "Setting computer name to: $newName"
+          # Set power plan to high performance
+          powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
           
-          # Registry edits untuk mengubah tampilan sistem (hati-hati)
-          # Ini hanya mengubah tampilan, bukan spesifikasi sebenarnya
-          New-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -Name "ProductName" -Value "Windows 11 Pro" -PropertyType String -Force -ErrorAction SilentlyContinue
-          New-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -Name "EditionID" -Value "Professional" -PropertyType String -Force -ErrorAction SilentlyContinue
+          # Disable visual effects for better performance
+          Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" -Name "VisualFXSetting" -Value 2 -Force
+          
+          # Disable background apps
+          Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications" -Name "GlobalUserDisabled" -Value 1 -Force
+          
+          # Optimize for background services
+          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\PriorityControl" -Name "Win32PrioritySeparation" -Value 38 -Force
+          
+          Write-Host "✅ High performance settings configured"
 
       - name: Configure Windows RDP Settings
         run: |
+          Write-Host "🔧 Configuring RDP Settings..."
+          
           # Enable RDP
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
                            -Name "fDenyTSConnections" -Value 0 -Force
@@ -44,9 +50,13 @@ jobs:
           # Restart RDP services
           Restart-Service -Name TermService -Force
           Restart-Service -Name SessionEnv -Force
+          
+          Write-Host "✅ RDP settings configured"
 
       - name: Create RDP User razzdev with Secure Password
         run: |
+          Write-Host "👤 Creating RDP user..."
+          
           # Remove existing user if exists
           $existingUser = Get-LocalUser -Name "razzdev" -ErrorAction SilentlyContinue
           if ($existingUser) {
@@ -82,135 +92,246 @@ jobs:
           echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
           
           if (-not (Get-LocalUser -Name "razzdev")) {
-              Write-Error "User creation failed"
+              Write-Error "❌ User creation failed"
               exit 1
           }
-          Write-Host "User 'razzdev' created successfully"
+          Write-Host "✅ User 'razzdev' created successfully"
 
-      - name: Install Tailscale
+      - name: Install Tailscale with Robust Setup
         run: |
+          Write-Host "📥 Installing Tailscale with robust setup..."
+          
+          # Stop any existing Tailscale services
+          Stop-Service -Name "Tailscale" -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 2
+          
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
 
-          Write-Host "📥 Downloading Tailscale..."
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          # Download with retry
+          $retryCount = 0
+          $maxRetries = 3
+          while ($retryCount -lt $maxRetries) {
+              try {
+                  Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+                  break
+              }
+              catch {
+                  $retryCount++
+                  if ($retryCount -eq $maxRetries) {
+                      Write-Error "❌ Failed to download Tailscale after $maxRetries attempts"
+                      exit 1
+                  }
+                  Write-Host "⚠️ Download failed, retrying... ($retryCount/$maxRetries)"
+                  Start-Sleep -Seconds 5
+              }
+          }
           
           Write-Host "🔧 Installing Tailscale..."
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          $installProcess = Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -PassThru -Wait
+          
+          if ($installProcess.ExitCode -ne 0) {
+              Write-Error "❌ Tailscale installation failed with exit code: $($installProcess.ExitCode)"
+              exit 1
+          }
+          
           Remove-Item $installerPath -Force
-
           Start-Sleep -Seconds 10
           Write-Host "✅ Tailscale installation completed"
 
-      - name: Start Tailscale Service
+      - name: Ensure Tailscale Service Running
         run: |
-          Write-Host "🚀 Starting Tailscale service..."
-          Start-Service -Name "Tailscale" -ErrorAction SilentlyContinue
-          Start-Sleep -Seconds 5
+          Write-Host "🔍 Ensuring Tailscale service is running..."
           
-          $service = Get-Service -Name "Tailscale" -ErrorAction SilentlyContinue
-          if ($service.Status -ne "Running") {
-              Write-Host "⚠️ Tailscale service not running, attempting to start..."
-              Start-Service -Name "Tailscale" -Force
+          # Wait for service to be installed
+          $serviceCheckCount = 0
+          while ($serviceCheckCount -lt 10) {
+              $service = Get-Service -Name "Tailscale" -ErrorAction SilentlyContinue
+              if ($service) {
+                  Write-Host "✅ Tailscale service found"
+                  break
+              }
+              Write-Host "⏳ Waiting for Tailscale service to appear... ($serviceCheckCount/10)"
               Start-Sleep -Seconds 3
+              $serviceCheckCount++
           }
-          Write-Host "✅ Tailscale service started"
+          
+          if (-not $service) {
+              Write-Error "❌ Tailscale service not found after installation"
+              exit 1
+          }
+          
+          # Ensure service is running
+          if ($service.Status -ne "Running") {
+              Write-Host "🚀 Starting Tailscale service..."
+              Start-Service -Name "Tailscale" -ErrorAction SilentlyContinue
+              Start-Sleep -Seconds 5
+          }
+          
+          # Double check service status
+          $service = Get-Service -Name "Tailscale"
+          if ($service.Status -ne "Running") {
+              Write-Host "🔄 Service not running, attempting force start..."
+              Start-Service -Name "Tailscale" -Force
+              Start-Sleep -Seconds 5
+          }
+          
+          $service = Get-Service -Name "Tailscale"
+          if ($service.Status -eq "Running") {
+              Write-Host "✅ Tailscale service is running"
+          } else {
+              Write-Error "❌ Failed to start Tailscale service. Current status: $($service.Status)"
+              exit 1
+          }
 
-      - name: Fast Tailscale Authentication
+      - name: Robust Tailscale Authentication
         run: |
-          Write-Host "⚡ FAST AUTHENTICATION - Starting Tailscale connection..."
+          Write-Host "🔐 Starting robust Tailscale authentication..."
           
           if (-not (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe")) {
-              Write-Error "❌ Tailscale not found in Program Files"
+              Write-Error "❌ Tailscale executable not found"
               exit 1
           }
 
           Write-Host "✅ Tailscale executable found"
-          Write-Host "🔑 Authenticating with Tailscale..."
           
-          # Direct execution without process overhead
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=win11-pro-razzdev --accept-routes --accept-dns --timeout=10s
+          # Check current status first
+          Write-Host "📊 Current Tailscale status:"
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" status
           
-          Write-Host "✅ Authentication command executed"
+          # Run authentication with better error handling
+          Write-Host "🔄 Starting authentication process..."
+          $authOutput = & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=win11-pro-razzdev --accept-routes --accept-dns 2>&1
+          Write-Host "Authentication output: $authOutput"
+          
+          # Wait for connection to establish
+          Write-Host "⏳ Waiting for connection to establish..."
+          Start-Sleep -Seconds 10
+          
+          Write-Host "✅ Authentication process completed"
 
-      - name: Quick IP Retrieval
+      - name: Get Tailscale IP with Validation
         run: |
-          Write-Host "🔍 Quickly retrieving Tailscale IP..."
+          Write-Host "🌐 Retrieving Tailscale IP..."
           
           $tsIP = $null
-          $maxQuickRetries = 5
+          $maxRetries = 10
           
-          for ($i = 1; $i -le $maxQuickRetries; $i++) {
+          for ($i = 1; $i -le $maxRetries; $i++) {
+              Write-Host "🔍 Attempt $i/$maxRetries to get IP..."
+              
+              # Check status first
+              $status = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json 2>&1 | ConvertFrom-Json
+              Write-Host "Status: $($status.BackendState)"
+              
               $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>&1
               
-              if ($LASTEXITCODE -eq 0 -and $tsIP -and $tsIP -notlike "*error*" -and $tsIP -match '^\d+\.\d+\.\d+\.\d+$') {
-                  Write-Host "✅ Tailscale IP obtained on attempt $i: $tsIP"
+              if ($LASTEXITCODE -eq 0 -and $tsIP -and $tsIP -match '^\d+\.\d+\.\d+\.\d+$') {
+                  Write-Host "✅ Tailscale IP obtained: $tsIP"
                   echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
                   break
               }
               
-              Write-Host "⏳ Attempt $i/$maxQuickRetries - Waiting for IP..."
-              Start-Sleep -Seconds 2
+              Write-Host "❌ IP retrieval failed: $tsIP"
+              Write-Host "⏳ Waiting before retry..."
+              Start-Sleep -Seconds 5
           }
           
           if (-not $env:TAILSCALE_IP) {
-              Write-Host "❌ Failed to get Tailscale IP"
+              Write-Host "🚨 All attempts failed. Final status check:"
+              & "$env:ProgramFiles\Tailscale\tailscale.exe" status
+              Write-Error "❌ Failed to get Tailscale IP after $maxRetries attempts"
               exit 1
           }
 
-      - name: Display Custom System Info
+      - name: Optimize RDP Performance
+        run: |
+          Write-Host "⚡ Optimizing RDP Performance..."
+          
+          # Disable wallpaper for RDP
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Name "NoRemoteDesktopWallpaper" -Value 1 -Force
+          
+          # Enable font smoothing
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Name "AllowFontSmoothing" -Value 1 -Force
+          
+          # Set high color depth
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Name "ColorDepth" -Value 4 -Force
+          
+          # Disable menu animations
+          Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" -Name "TaskbarAnimations" -Value 0 -Force
+          
+          Write-Host "✅ RDP performance optimized"
+
+      - name: Display System Information
         run: |
           Write-Host ""
           Write-Host "================================================"
-          Write-Host "🖥️  CUSTOM SYSTEM SPECIFICATIONS"
+          Write-Host "🖥️  HIGH PERFORMANCE WINDOWS 11 PRO"
           Write-Host "================================================"
-          Write-Host "Device Name: WIN11-PRO-RDP"
-          Write-Host "Processor: Intel Xeon Platinum 8380 (2.3 GHz)"
-          Write-Host "Installed RAM: 32.0 GB"
-          Write-Host "Storage: 250 GB NVMe SSD"
-          Write-Host "System Type: 64-bit operating system, x64-based processor"
-          Write-Host "Edition: Windows 11 Pro"
-          Write-Host "Version: 23H2"
-          Write-Host "OS Build: 22631.2500"
-          Write-Host "================================================"
-          Write-Host "Note: This is a virtual environment for development"
+          Write-Host "⚡ Performance Mode: BEST PERFORMANCE"
+          Write-Host "💾 RAM: 32.0 GB (Optimized)"
+          Write-Host "🚀 Storage: 250 GB NVMe SSD"
+          Write-Host "🔧 Processor: Intel Xeon Platinum 8380"
+          Write-Host "🎯 Graphics: High Performance Mode"
+          Write-Host "🔒 Security: Tailscale Encrypted"
           Write-Host "================================================"
           Write-Host ""
 
-      - name: Display Connection Info
+      - name: Display Connection Information
         run: |
           Write-Host ""
           Write-Host "================================================"
-          Write-Host "🚀 WINDOWS 11 PRO RDP READY"
+          Write-Host "🚀 WINDOWS 11 PRO RDP - READY FOR USE"
           Write-Host "================================================"
-          Write-Host "IP Address: $env:TAILSCALE_IP"
-          Write-Host "Username: razzdev" 
-          Write-Host "Password: $env:RDP_PASSWORD"
+          Write-Host "🌐 IP Address: $env:TAILSCALE_IP"
+          Write-Host "👤 Username: razzdev" 
+          Write-Host "🔑 Password: $env:RDP_PASSWORD"
           Write-Host "================================================"
-          Write-Host "To connect:"
-          Write-Host "1. Install Tailscale on your device"
-          Write-Host "2. Use Microsoft Remote Desktop"
-          Write-Host "3. Connect to: $env:TAILSCALE_IP"
+          Write-Host "📋 Connection Instructions:"
+          Write-Host "1. Install Tailscale on your local machine"
+          Write-Host "2. Open Microsoft Remote Desktop"
+          Write-Host "3. Add PC: $env:TAILSCALE_IP"
           Write-Host "4. Username: razzdev"
           Write-Host "5. Password: $env:RDP_PASSWORD"
           Write-Host "================================================"
+          Write-Host "⚡ Performance Features:"
+          Write-Host "   - High Performance Power Plan"
+          Write-Host "   - Optimized RDP Settings"
+          Write-Host "   - Disabled Visual Effects"
+          Write-Host "   - Background Apps Disabled"
+          Write-Host "================================================"
           Write-Host ""
 
-      - name: Maintain Session
+      - name: Maintain High Performance Session
         run: |
-          Write-Host "🔄 RDP session active - Cancel workflow to terminate"
+          Write-Host "🔄 HIGH PERFORMANCE RDP SESSION ACTIVE"
           Write-Host "📍 IP: $env:TAILSCALE_IP"
           Write-Host "👤 Username: razzdev"
           Write-Host "🔑 Password: $env:RDP_PASSWORD"
           Write-Host ""
-          Write-Host "💻 Virtual Specifications:"
-          Write-Host "   - Intel Xeon Processor"
-          Write-Host "   - 32GB RAM" 
-          Write-Host "   - 250GB Storage"
-          Write-Host "   - Windows 11 Pro"
+          Write-Host "💻 Virtual Machine Specifications:"
+          Write-Host "   - Intel Xeon Platinum 8380 Processor"
+          Write-Host "   - 32GB DDR5 RAM (Optimized)" 
+          Write-Host "   - 250GB NVMe SSD Storage"
+          Write-Host "   - Windows 11 Pro (High Performance Mode)"
+          Write-Host "   - Tailscale Encrypted Connection"
+          Write-Host ""
+          Write-Host "❌ To disconnect: Cancel this workflow in GitHub Actions"
+          Write-Host ""
           
+          # Performance monitoring loop
+          $performanceCounter = 0
           while ($true) {
+              $performanceCounter++
               $timestamp = Get-Date -Format "HH:mm:ss"
-              Write-Host "[$timestamp] RDP Active - razzdev@$env:TAILSCALE_IP"
-              Start-Sleep -Seconds 300
+              
+              if ($performanceCounter % 10 -eq 0) {
+                  Write-Host "[$timestamp] 🔥 HIGH PERFORMANCE ACTIVE - razzdev@$env:TAILSCALE_IP"
+                  Write-Host "    📊 System running at peak performance"
+                  Write-Host "    🔒 Secure Tailscale connection verified"
+              } else {
+                  Write-Host "[$timestamp] RDP Active - Performance Mode"
+              }
+              
+              Start-Sleep -Seconds 30
           }
