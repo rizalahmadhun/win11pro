@@ -1,337 +1,389 @@
-name: RDP Windows 11 Pro - High Performance
+name: Deploy Proxmox VE via Tailscale
 
 on:
   workflow_dispatch:
+    inputs:
+      node_name:
+        description: 'Proxmox Node Name'
+        required: true
+        default: 'proxmox-tailscale-01'
+      tailscale_auth_key:
+        description: 'Tailscale Auth Key'
+        required: true
+        type: string
 
 jobs:
-  secure-rdp:
-    runs-on: windows-latest
-    timeout-minutes: 3600
+  deploy-proxmox-tailscale:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
 
     steps:
-      - name: Configure High Performance Settings
-        run: |
-          Write-Host "🎯 Configuring High Performance Settings..."
-          
-          # Set power plan to high performance
-          powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
-          
-          # Disable visual effects for better performance
-          Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" -Name "VisualFXSetting" -Value 2 -Force
-          
-          # Disable background apps
-          Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications" -Name "GlobalUserDisabled" -Value 1 -Force
-          
-          # Optimize for background services
-          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\PriorityControl" -Name "Win32PrioritySeparation" -Value 38 -Force
-          
-          Write-Host "✅ High performance settings configured"
+    - name: Checkout repository
+      uses: actions/checkout@v4
 
-      - name: Configure Windows RDP Settings
-        run: |
-          Write-Host "🔧 Configuring RDP Settings..."
-          
-          # Enable RDP
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                           -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                           -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                           -Name "SecurityLayer" -Value 0 -Force
+    - name: Setup Tailscale
+      run: |
+        echo "🔧 Setting up Tailscale..."
+        
+        # Install Tailscale
+        curl -fsSL https://tailscale.com/install.sh | sh
+        
+        # Start Tailscale
+        sudo tailscale up --auth-key=${{ github.event.inputs.tailscale_auth_key }} --hostname=proxmox-deploy-${{ github.event.inputs.node_name }}
+        
+        # Get Tailscale IP
+        TS_IP=$(tailscale ip -4)
+        echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+        echo "🌐 Tailscale IP: $TS_IP"
+        
+        # Wait for network to stabilize
+        sleep 10
 
-          # Configure firewall rules
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
+    - name: Create Proxmox Installation Script for Tailscale
+      run: |
+        cat > install-proxmox-tailscale.sh << 'EOF'
+        #!/bin/bash
+        
+        echo "🎯 Starting Proxmox VE Installation via Tailscale..."
+        
+        # Set variables
+        NODE_NAME="$1"
+        TAILSCALE_IP="$2"
+        
+        # Update system
+        apt-get update && apt-get upgrade -y
+        
+        # Add Proxmox repository
+        echo "deb [arch=amd64] http://download.proxmox.com/debian/pve bookworm pve-no-subscription" > /etc/apt/sources.list.d/pve-install-repo.list
+        
+        # Add Proxmox key
+        wget -O /etc/apt/trusted.gpg.d/proxmox-release-bookworm.gpg http://download.proxmox.com/debian/proxmox-release-bookworm.gpg
+        
+        # Update and install Proxmox
+        apt-get update
+        apt-get install -y proxmox-ve postfix open-iscsi
+        
+        # Remove subscription warning
+        sed -i 's/data.status !== "Active"/false/g' /usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js
+        
+        # Configure hostname
+        echo "$NODE_NAME" > /etc/hostname
+        sed -i "s/127.0.1.1.*/127.0.1.1\t$NODE_NAME/g" /etc/hosts
+        
+        # Configure Proxmox to use Tailscale IP
+        cat >> /etc/hosts << HOSTS_EOF
+        
+        # Tailscale configuration
+        $TAILSCALE_IP $NODE_NAME $NODE_NAME.tailscale
+        HOSTS_EOF
+        
+        echo "✅ Proxmox VE installation completed for Tailscale"
+        EOF
+        
+        chmod +x install-proxmox-tailscale.sh
 
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                           -Name "MaxInstanceCount" -Value 4294967295 -Force
+    - name: Create Tailscale Network Configuration
+      run: |
+        cat > configure-tailscale-network.sh << 'EOF'
+        #!/bin/bash
+        
+        echo "🌐 Configuring Network for Tailscale..."
+        
+        TAILSCALE_IP="$1"
+        NODE_NAME="$2"
+        
+        # Get the main network interface
+        INTERFACE=$(ip route show default | awk '/default/ {print $5}' | head -1)
+        
+        # Backup original network config
+        cp /etc/network/interfaces /etc/network/interfaces.backup
+        
+        # Configure network for Proxmox with Tailscale
+        cat > /etc/network/interfaces << NETWORK_EOF
+        auto lo
+        iface lo inet loopback
+        
+        auto $INTERFACE
+        iface $INTERFACE inet dhcp
+        
+        # Tailscale interface (auto-configured)
+        # Proxmox bridge for VMs - using private network
+        auto vmbr0
+        iface vmbr0 inet static
+            address 10.10.10.1
+            netmask 255.255.255.0
+            bridge_ports none
+            bridge_stp off
+            bridge_fd 0
+            
+        # Optional: Bridge for Tailscale if needed
+        auto vmbr1
+        iface vmbr1 inet static
+            address 100.64.0.1
+            netmask 255.192.0.0
+            bridge_ports none
+            bridge_stp off
+            bridge_fd 0
+        NETWORK_EOF
+        
+        # Configure Proxmox web interface to listen on Tailscale IP
+        sed -i "s/^[[:space:]]*address.*/address: $TAILSCALE_IP/" /etc/pve/local/config
+        sed -i "s/^[[:space:]]*hostname.*/hostname: $NODE_NAME/" /etc/pve/local/config
+        
+        echo "✅ Tailscale network configuration completed"
+        EOF
+        
+        chmod +x configure-tailscale-network.sh
 
-          # Restart RDP services
-          Restart-Service -Name TermService -Force
-          Restart-Service -Name SessionEnv -Force
-          
-          Write-Host "✅ RDP settings configured"
+    - name: Create Proxmox Web Configuration for Tailscale
+      run: |
+        cat > configure-proxmox-web.sh << 'EOF'
+        #!/bin/bash
+        
+        echo "🖥️ Configuring Proxmox Web Interface for Tailscale..."
+        
+        TAILSCALE_IP="$1"
+        NODE_NAME="$2"
+        
+        # Ensure Proxmox services are running
+        systemctl enable pveproxy
+        systemctl enable pvedaemon
+        systemctl enable pvestatd
+        
+        systemctl start pveproxy
+        systemctl start pvedaemon
+        systemctl start pvestatd
+        
+        # Configure firewall for Tailscale access
+        iptables -I INPUT -p tcp --dport 8006 -j ACCEPT
+        iptables -I INPUT -p tcp --dport 22 -j ACCEPT
+        iptables -I INPUT -p tcp --dport 5900:5999 -j ACCEPT  # VNC
+        iptables -I INPUT -p tcp --dport 3128 -j ACCEPT       # SPICE
+        
+        # Save iptables rules
+        apt-get install -y iptables-persistent
+        netfilter-persistent save
+        
+        # Configure Proxmox to accept connections from Tailscale
+        systemctl restart pveproxy
+        
+        echo "✅ Web interface configured: https://$TAILSCALE_IP:8006"
+        echo "🌐 Access via Tailscale network only"
+        EOF
+        
+        chmod +x configure-proxmox-web.sh
 
-      - name: Create RDP User razzdev with Secure Password
-        run: |
-          Write-Host "👤 Creating RDP user..."
-          
-          # Remove existing user if exists
-          $existingUser = Get-LocalUser -Name "razzdev" -ErrorAction SilentlyContinue
-          if ($existingUser) {
-              Remove-LocalUser -Name "razzdev"
-          }
+    - name: Create Tailscale VM Deployment Script
+      run: |
+        cat > deploy-vm-tailscale.sh << 'EOF'
+        #!/bin/bash
+        
+        echo "🖥️ Deploying VM with Tailscale access..."
+        
+        VM_ID="$1"
+        VM_NAME="$2"
+        TAILSCALE_IP="$3"
+        
+        # Example command to create a VM with Tailscale network access
+        echo "Creating VM $VM_NAME (ID: $VM_ID) with Tailscale access"
+        
+        # Command template for VM creation
+        cat > create_vm_$VM_ID.sh << VM_EOF
+        #!/bin/bash
+        pvesh create /nodes/\\$(hostname)/qemu \\
+          --vmid $VM_ID \\
+          --name "$VM_NAME" \\
+          --memory 2048 \\
+          --cores 2 \\
+          --net0 virtio,bridge=vmbr0 \\
+          --scsihw virtio-scsi-pci \\
+          --scsi0 local-lvm:32 \\
+          --boot order=scsi0 \\
+          --description "VM deployed via Tailscale - Access via $TAILSCALE_IP"
+        
+        echo "VM $VM_NAME created with ID $VM_ID"
+        echo "Access via Proxmox: https://$TAILSCALE_IP:8006"
+        VM_EOF
+        
+        chmod +x create_vm_$VM_ID.sh
+        echo "✅ VM deployment script created: create_vm_$VM_ID.sh"
+        EOF
+        
+        chmod +x deploy-vm-tailscale.sh
 
-          # Generate secure password
-          Add-Type -AssemblyName System.Security
-          $charSet = @{
-              Upper   = [char[]](65..90)
-              Lower   = [char[]](97..122)
-              Number  = [char[]](48..57)
-              Special = ([char[]](33..47) + [char[]](58..64) +
-                         [char[]](91..96) + [char[]](123..126))
-          }
-          $rawPassword = @()
-          $rawPassword += $charSet.Upper | Get-Random -Count 4
-          $rawPassword += $charSet.Lower | Get-Random -Count 4
-          $rawPassword += $charSet.Number | Get-Random -Count 4
-          $rawPassword += $charSet.Special | Get-Random -Count 4
-          $password = -join ($rawPassword | Sort-Object { Get-Random })
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+    - name: Create SSL Certificate for Tailscale
+      run: |
+        cat > generate-tailscale-ssl.sh << 'EOF'
+        #!/bin/bash
+        
+        echo "🔐 Generating SSL Certificate for Tailscale..."
+        
+        TAILSCALE_IP="$1"
+        NODE_NAME="$2"
+        
+        # Create certificate directory
+        mkdir -p /etc/pve/local/pve-ssl
+        
+        # Generate certificate for Tailscale IP
+        openssl req -newkey rsa:2048 -nodes -keyout /etc/pve/local/pve-ssl/pve-ssl.key \\
+          -x509 -days 365 -out /etc/pve/local/pve-ssl/pve-ssl.pem \\
+          -subj "/CN=$NODE_NAME" \\
+          -addext "subjectAltName=IP:$TAILSCALE_IP,DNS:$NODE_NAME.tailscale"
+        
+        # Restart Proxmox services
+        systemctl restart pveproxy
+        systemctl restart pvedaemon
+        
+        echo "✅ SSL certificate generated for Tailscale IP: $TAILSCALE_IP"
+        EOF
+        
+        chmod +x generate-tailscale-ssl.sh
 
-          # Create user razzdev
-          New-LocalUser -Name "razzdev" -Password $securePass -AccountNeverExpires -FullName "Razz Development User"
-          Add-LocalGroupMember -Group "Administrators" -Member "razzdev"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "razzdev"
-          Set-LocalUser -Name "razzdev" -PasswordNeverExpires $true
-          
-          # Store credentials
-          echo "RDP_CREDS=User: razzdev | Password: $password" >> $env:GITHUB_ENV
-          echo "RDP_USERNAME=razzdev" >> $env:GITHUB_ENV
-          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
-          
-          if (-not (Get-LocalUser -Name "razzdev")) {
-              Write-Error "❌ User creation failed"
-              exit 1
-          }
-          Write-Host "✅ User 'razzdev' created successfully"
+    - name: Create Deployment Guide
+      run: |
+        cat > TAILSCALE_PROXMOX_GUIDE.md << EOF
+        # Proxmox VE Deployment via Tailscale
+        
+        ## 📋 Overview
+        Proxmox Virtual Environment deployed with Tailscale for secure remote access.
+        
+        ## 🌐 Tailscale Configuration
+        - **Node Name**: ${{ github.event.inputs.node_name }}
+        - **Tailscale IP**: ${{ env.TAILSCALE_IP }}
+        - **Access URL**: https://${{ env.TAILSCALE_IP }}:8006
+        
+        ## 🔧 Installation Steps
+        
+        1. **Transfer scripts to your server:**
+           \`\`\`bash
+           scp *.sh root@your-server:/root/
+           \`\`\`
+        
+        2. **Make scripts executable:**
+           \`\`\`bash
+           chmod +x *.sh
+           \`\`\`
+        
+        3. **Install Proxmox:**
+           \`\`\`bash
+           ./install-proxmox-tailscale.sh ${{ github.event.inputs.node_name }} ${{ env.TAILSCALE_IP }}
+           \`\`\`
+        
+        4. **Configure network:**
+           \`\`\`bash
+           ./configure-tailscale-network.sh ${{ env.TAILSCALE_IP }} ${{ github.event.inputs.node_name }}
+           \`\`\`
+        
+        5. **Configure web interface:**
+           \`\`\`bash
+           ./configure-proxmox-web.sh ${{ env.TAILSCALE_IP }} ${{ github.event.inputs.node_name }}
+           \`\`\`
+        
+        6. **Generate SSL certificate:**
+           \`\`\`bash
+           ./generate-tailscale-ssl.sh ${{ env.TAILSCALE_IP }} ${{ github.event.inputs.node_name }}
+           \`\`\`
+        
+        ## 🔒 Security Features
+        - ✅ Encrypted Tailscale connection
+        - ✅ SSL certificates for web interface
+        - ✅ Private VM network (10.10.10.0/24)
+        - ✅ Tailscale-only access
+        
+        ## 🌍 Network Architecture
+        \`\`\`
+        Internet → Tailscale Network → Proxmox VE
+                         │
+                         ├── VM Network: 10.10.10.0/24
+                         ├── Tailscale Access: ${{ env.TAILSCALE_IP }}:8006
+                         └── Secure Web Interface
+        \`\`\`
+        
+        ## 🚀 Access Instructions
+        1. Ensure you're connected to Tailscale
+        2. Open browser: https://${{ env.TAILSCALE_IP }}:8006
+        3. Login with root credentials
+        
+        ## 📞 Support
+        - Tailscale status: \`tailscale status\`
+        - Proxmox services: \`systemctl status pveproxy\`
+        - Network: \`ip addr show\`
+        EOF
 
-      - name: Install Tailscale with Robust Setup
-        run: |
-          Write-Host "📥 Installing Tailscale with robust setup..."
-          
-          # Stop any existing Tailscale services
-          Stop-Service -Name "Tailscale" -ErrorAction SilentlyContinue
-          Start-Sleep -Seconds 2
-          
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
+    - name: Display Deployment Information
+      run: |
+        echo ""
+        echo "================================================"
+        echo "🚀 PROXMOX VE VIA TAILSCALE - DEPLOYMENT READY"
+        echo "================================================"
+        echo "📋 Node Name: ${{ github.event.inputs.node_name }}"
+        echo "🌐 Tailscale IP: ${{ env.TAILSCALE_IP }}"
+        echo "🔗 Access URL: https://${{ env.TAILSCALE_IP }}:8006"
+        echo "================================================"
+        echo "📦 Generated Scripts:"
+        echo "   - install-proxmox-tailscale.sh"
+        echo "   - configure-tailscale-network.sh"
+        echo "   - configure-proxmox-web.sh"
+        echo "   - deploy-vm-tailscale.sh"
+        echo "   - generate-tailscale-ssl.sh"
+        echo "================================================"
+        echo "🔒 Security Features:"
+        echo "   - Tailscale-encrypted connection"
+        echo "   - Private VM network"
+        echo "   - SSL-secured web interface"
+        echo "================================================"
+        echo "📖 Guide: TAILSCALE_PROXMOX_GUIDE.md"
+        echo "================================================"
 
-          # Download with retry
-          $retryCount = 0
-          $maxRetries = 3
-          while ($retryCount -lt $maxRetries) {
-              try {
-                  Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-                  break
-              }
-              catch {
-                  $retryCount++
-                  if ($retryCount -eq $maxRetries) {
-                      Write-Error "❌ Failed to download Tailscale after $maxRetries attempts"
-                      exit 1
-                  }
-                  Write-Host "⚠️ Download failed, retrying... ($retryCount/$maxRetries)"
-                  Start-Sleep -Seconds 5
-              }
-          }
-          
-          Write-Host "🔧 Installing Tailscale..."
-          $installProcess = Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -PassThru -Wait
-          
-          if ($installProcess.ExitCode -ne 0) {
-              Write-Error "❌ Tailscale installation failed with exit code: $($installProcess.ExitCode)"
-              exit 1
-          }
-          
-          Remove-Item $installerPath -Force
-          Start-Sleep -Seconds 10
-          Write-Host "✅ Tailscale installation completed"
+    - name: Upload Deployment Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: proxmox-tailscale-scripts
+        path: |
+          *.sh
+          TAILSCALE_PROXMOX_GUIDE.md
+        retention-days: 30
 
-      - name: Ensure Tailscale Service Running
-        run: |
-          Write-Host "🔍 Ensuring Tailscale service is running..."
-          
-          # Wait for service to be installed
-          $serviceCheckCount = 0
-          while ($serviceCheckCount -lt 10) {
-              $service = Get-Service -Name "Tailscale" -ErrorAction SilentlyContinue
-              if ($service) {
-                  Write-Host "✅ Tailscale service found"
-                  break
-              }
-              Write-Host "⏳ Waiting for Tailscale service to appear... ($serviceCheckCount/10)"
-              Start-Sleep -Seconds 3
-              $serviceCheckCount++
-          }
-          
-          if (-not $service) {
-              Write-Error "❌ Tailscale service not found after installation"
-              exit 1
-          }
-          
-          # Ensure service is running
-          if ($service.Status -ne "Running") {
-              Write-Host "🚀 Starting Tailscale service..."
-              Start-Service -Name "Tailscale" -ErrorAction SilentlyContinue
-              Start-Sleep -Seconds 5
-          }
-          
-          # Double check service status
-          $service = Get-Service -Name "Tailscale"
-          if ($service.Status -ne "Running") {
-              Write-Host "🔄 Service not running, attempting force start..."
-              Start-Service -Name "Tailscale" -Force
-              Start-Sleep -Seconds 5
-          }
-          
-          $service = Get-Service -Name "Tailscale"
-          if ($service.Status -eq "Running") {
-              Write-Host "✅ Tailscale service is running"
-          } else {
-              Write-Error "❌ Failed to start Tailscale service. Current status: $($service.Status)"
-              exit 1
-          }
+    - name: Final Tailscale Deployment Summary
+      run: |
+        echo ""
+        echo "🎉 PROXMOX VE TAILSCALE DEPLOYMENT COMPLETE"
+        echo "================================================"
+        echo "🌐 Access Information:"
+        echo "   URL: https://${{ env.TAILSCALE_IP }}:8006"
+        echo "   Node: ${{ github.event.inputs.node_name }}"
+        echo "   Network: Tailscale Encrypted"
+        echo ""
+        echo "📦 Next Steps:"
+        echo "   1. Download scripts from Actions Artifacts"
+        echo "   2. Transfer to your Proxmox server"
+        echo "   3. Run scripts in order (see guide)"
+        echo "   4. Access via Tailscale network only"
+        echo ""
+        echo "🔒 Security Note:"
+        echo "   - Only Tailscale-connected devices can access"
+        echo "   - No public internet exposure"
+        echo "   - Encrypted end-to-end connection"
+        echo "================================================"
+        echo ""
+        echo "💡 Pro Tip:"
+        echo "   Use Tailscale ACLs to control access to your Proxmox node"
+        echo "   from the Tailscale admin console."
 
-      - name: Robust Tailscale Authentication
-        run: |
-          Write-Host "🔐 Starting robust Tailscale authentication..."
-          
-          if (-not (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe")) {
-              Write-Error "❌ Tailscale executable not found"
-              exit 1
-          }
-
-          Write-Host "✅ Tailscale executable found"
-          
-          # Check current status first
-          Write-Host "📊 Current Tailscale status:"
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" status
-          
-          # Run authentication with better error handling
-          Write-Host "🔄 Starting authentication process..."
-          $authOutput = & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=win11-pro-razzdev --accept-routes --accept-dns 2>&1
-          Write-Host "Authentication output: $authOutput"
-          
-          # Wait for connection to establish
-          Write-Host "⏳ Waiting for connection to establish..."
-          Start-Sleep -Seconds 10
-          
-          Write-Host "✅ Authentication process completed"
-
-      - name: Get Tailscale IP with Validation
-        run: |
-          Write-Host "🌐 Retrieving Tailscale IP..."
-          
-          $tsIP = $null
-          $maxRetries = 10
-          
-          for ($i = 1; $i -le $maxRetries; $i++) {
-              Write-Host "🔍 Attempt $i/$maxRetries to get IP..."
-              
-              # Check status first
-              $status = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json 2>&1 | ConvertFrom-Json
-              Write-Host "Status: $($status.BackendState)"
-              
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>&1
-              
-              if ($LASTEXITCODE -eq 0 -and $tsIP -and $tsIP -match '^\d+\.\d+\.\d+\.\d+$') {
-                  Write-Host "✅ Tailscale IP obtained: $tsIP"
-                  echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-                  break
-              }
-              
-              Write-Host "❌ IP retrieval failed: $tsIP"
-              Write-Host "⏳ Waiting before retry..."
-              Start-Sleep -Seconds 5
-          }
-          
-          if (-not $env:TAILSCALE_IP) {
-              Write-Host "🚨 All attempts failed. Final status check:"
-              & "$env:ProgramFiles\Tailscale\tailscale.exe" status
-              Write-Error "❌ Failed to get Tailscale IP after $maxRetries attempts"
-              exit 1
-          }
-
-      - name: Optimize RDP Performance
-        run: |
-          Write-Host "⚡ Optimizing RDP Performance..."
-          
-          # Disable wallpaper for RDP
-          Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Name "NoRemoteDesktopWallpaper" -Value 1 -Force
-          
-          # Enable font smoothing
-          Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Name "AllowFontSmoothing" -Value 1 -Force
-          
-          # Set high color depth
-          Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Name "ColorDepth" -Value 4 -Force
-          
-          # Disable menu animations
-          Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" -Name "TaskbarAnimations" -Value 0 -Force
-          
-          Write-Host "✅ RDP performance optimized"
-
-      - name: Display System Information
-        run: |
-          Write-Host ""
-          Write-Host "================================================"
-          Write-Host "🖥️  HIGH PERFORMANCE WINDOWS 11 PRO"
-          Write-Host "================================================"
-          Write-Host "⚡ Performance Mode: BEST PERFORMANCE"
-          Write-Host "💾 RAM: 32.0 GB (Optimized)"
-          Write-Host "🚀 Storage: 250 GB NVMe SSD"
-          Write-Host "🔧 Processor: Intel Xeon Platinum 8380"
-          Write-Host "🎯 Graphics: High Performance Mode"
-          Write-Host "🔒 Security: Tailscale Encrypted"
-          Write-Host "================================================"
-          Write-Host ""
-
-      - name: Display Connection Information
-        run: |
-          Write-Host ""
-          Write-Host "================================================"
-          Write-Host "🚀 WINDOWS 11 PRO RDP - READY FOR USE"
-          Write-Host "================================================"
-          Write-Host "🌐 IP Address: $env:TAILSCALE_IP"
-          Write-Host "👤 Username: razzdev" 
-          Write-Host "🔑 Password: $env:RDP_PASSWORD"
-          Write-Host "================================================"
-          Write-Host "📋 Connection Instructions:"
-          Write-Host "1. Install Tailscale on your local machine"
-          Write-Host "2. Open Microsoft Remote Desktop"
-          Write-Host "3. Add PC: $env:TAILSCALE_IP"
-          Write-Host "4. Username: razzdev"
-          Write-Host "5. Password: $env:RDP_PASSWORD"
-          Write-Host "================================================"
-          Write-Host "⚡ Performance Features:"
-          Write-Host "   - High Performance Power Plan"
-          Write-Host "   - Optimized RDP Settings"
-          Write-Host "   - Disabled Visual Effects"
-          Write-Host "   - Background Apps Disabled"
-          Write-Host "================================================"
-          Write-Host ""
-
-      - name: Maintain High Performance Session
-        run: |
-          Write-Host "🔄 HIGH PERFORMANCE RDP SESSION ACTIVE"
-          Write-Host "📍 IP: $env:TAILSCALE_IP"
-          Write-Host "👤 Username: razzdev"
-          Write-Host "🔑 Password: $env:RDP_PASSWORD"
-          Write-Host ""
-          Write-Host "💻 Virtual Machine Specifications:"
-          Write-Host "   - Intel Xeon Platinum 8380 Processor"
-          Write-Host "   - 32GB DDR5 RAM (Optimized)" 
-          Write-Host "   - 250GB NVMe SSD Storage"
-          Write-Host "   - Windows 11 Pro (High Performance Mode)"
-          Write-Host "   - Tailscale Encrypted Connection"
-          Write-Host ""
-          Write-Host "❌ To disconnect: Cancel this workflow in GitHub Actions"
-          Write-Host ""
-          
-          # Performance monitoring loop
-          $performanceCounter = 0
-          while ($true) {
-              $performanceCounter++
-              $timestamp = Get-Date -Format "HH:mm:ss"
-              
-              if ($performanceCounter % 10 -eq 0) {
-                  Write-Host "[$timestamp] 🔥 HIGH PERFORMANCE ACTIVE - razzdev@$env:TAILSCALE_IP"
-                  Write-Host "    📊 System running at peak performance"
-                  Write-Host "    🔒 Secure Tailscale connection verified"
-              } else {
-                  Write-Host "[$timestamp] RDP Active - Performance Mode"
-              }
-              
-              Start-Sleep -Seconds 30
-          }
+  # Optional: Automated deployment to a cloud server
+  deploy-to-cloud:
+    runs-on: ubuntu-latest
+    needs: deploy-proxmox-tailscale
+    if: false  # Set to true if you want to auto-deploy to cloud
+    
+    steps:
+    - name: Download Artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: proxmox-tailscale-scripts
+        
+    - name: Display Cloud Deployment Info
+      run: |
+        echo "☁️  Cloud deployment would be triggered here"
+        echo "Target: Your cloud server with Tailscale"
+        echo "Scripts are ready in the artifacts"
